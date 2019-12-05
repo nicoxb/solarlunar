@@ -2,16 +2,17 @@ package festival
 
 import (
 	"fmt"
-	"github.com/bitly/go-simplejson"
-	"github.com/nosixtools/solarlunar"
 	"io/ioutil"
 	"regexp"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/bitly/go-simplejson"
+	"github.com/nosixtools/solarlunar"
 )
 
-var RULE_PATTERN = "^(solar|lunar)\\((?:m(\\d+)):(ld|(?:d|(?:fw|lw|w(\\d+))n|(?:s\\d+))(\\d+))\\)=\\S+$"
+var RULE_PATTERN = "^(solar|lunar)\\((?:m(\\d+)):(ld|(?:d|(?:fw|lw|w(\\d+))n|(?:s\\d+))(\\d+))\\)=.+$"
 var PATTERN = "^(solar|lunar)\\((?:m(\\d+)):(ld|(?:d|(?:fw|lw|w(\\d+))n|(?:s\\d+))(\\d+))\\)$"
 var MONTH_SOLAR_FESTIVAL = map[string][]string{}
 var MONTH_LUNAR_FESTIVAL = map[string][]string{}
@@ -21,19 +22,26 @@ var DATELAYOUT = "2006-01-02"
 
 type Festival struct {
 	filename string
+	local    string
 }
 
-func NewFestival(filename string) *Festival {
+func NewFestival(filename, local string) *Festival {
 	if filename == "" {
 		filename = "./festival.json"
 	}
+	if local == "" {
+		local = "Local"
+	}
 	readFestivalRuleFromFile(filename)
-	return &Festival{filename: filename}
+	return &Festival{
+		filename: filename,
+		local:    local,
+	}
 }
 
 func (f *Festival) GetFestivals(solarDay string) (festivals []string) {
 	festivals = []string{}
-	loc, _ := time.LoadLocation("Local")
+	loc, _ := time.LoadLocation(f.local)
 
 	//处理公历节日
 	tempDate, _ := time.ParseInLocation(DATELAYOUT, solarDay, loc)
@@ -43,7 +51,22 @@ func (f *Festival) GetFestivals(solarDay string) (festivals []string) {
 	//处理农历节日
 	lunarDate, isLeapMonth := solarlunar.SolarToLuanr(solarDay)
 	if !isLeapMonth {
-		tempDate, _ := time.ParseInLocation(DATELAYOUT, lunarDate, loc)
+		// 此方式解析农历可能会失败
+		tempDate, err := time.ParseInLocation(DATELAYOUT, lunarDate, loc)
+		if err != nil {
+			items := strings.Split(lunarDate, "-")
+			if len(items) != 3 {
+				return
+			}
+
+			y, yerr := strconv.Atoi(items[0])
+			m, merr := strconv.Atoi(items[0])
+			d, derr := strconv.Atoi(items[0])
+			if yerr != nil || merr != nil || derr != nil {
+				return
+			}
+			tempDate = time.Date(y, time.Month(m), d, 0, 0, 0, 1, loc)
+		}
 		for _, festival := range processRule(tempDate, MONTH_LUNAR_FESTIVAL, true, solarDay) {
 			festivals = append(festivals, festival)
 		}
@@ -123,8 +146,8 @@ func processRule(date time.Time, ruleMap map[string][]string, isLunar bool, sola
 		reg, _ := regexp.Compile(PATTERN)
 		subMatch := reg.FindStringSubmatch(items[0])
 		festivalMonth := subMatch[2]
-		if strings.HasPrefix(subMatch[3], "s456") &&  !isLunar { //特殊处理清明节
-			festivalDay:= getQingMingFestival(year)
+		if strings.HasPrefix(subMatch[3], "s456") && !isLunar { //特殊处理清明节
+			festivalDay := getQingMingFestival(year)
 			if month == festivalMonth && day == festivalDay {
 				festivals = append(festivals, items[1])
 			}
@@ -149,15 +172,23 @@ func processRule(date time.Time, ruleMap map[string][]string, isLunar bool, sola
 		} else if strings.HasPrefix(subMatch[3], "w") {
 			festivalWeek := subMatch[3][1:2]
 			festivalDayOfWeek := subMatch[3][3:4]
-			week := strconv.Itoa(weekOfMonth(date))
-			dayOfWeek := strconv.Itoa((int(date.Weekday()) + 1) % 7)
-			if festivalWeek == week && festivalDayOfWeek == dayOfWeek {
+			festivalWeekInt, err := strconv.Atoi(festivalWeek)
+			if err != nil {
+				continue
+			}
+			festivalDayOfWeekInt, err := strconv.Atoi(festivalDayOfWeek)
+			if err != nil {
+				continue
+			}
+
+			if IsWeekdayN(date, time.Weekday(festivalDayOfWeekInt-1), festivalWeekInt) {
 				festivals = append(festivals, items[1])
 			}
 			continue
 		} else if strings.HasPrefix(subMatch[3], "lw") {
 			festivalDayOfWeek, _ := strconv.Atoi(subMatch[3][3:4])
-			if isDayOfLastWeeekInTheMonth(date, festivalDayOfWeek) {
+			if IsWeekdayN(date, time.Weekday(festivalDayOfWeek-1), -1) {
+				// if isDayOfLastWeeekInTheMonth(date, festivalDayOfWeek) {
 				festivals = append(festivals, items[1])
 			}
 			continue
@@ -176,16 +207,17 @@ func processRule(date time.Time, ruleMap map[string][]string, isLunar bool, sola
 	}
 	return festivals
 }
+
 // 清明节算法 公式：int((yy*d+c)-(yy/4.0)) 公式解读：y=年数后2位，d=0.2422，1=闰年数，21世纪c=4081，20世纪c=5.59
 func getQingMingFestival(year int) string {
 	var val float64
 	if year >= 2000 { //21世纪
 		val = 4.81
-	} else { 		  //20世纪
+	} else { //20世纪
 		val = 5.59
 	}
 	d := float64(year % 100)
-	day := int(d * 0.2422 + val - float64(int(d)/4))
+	day := int(d*0.2422 + val - float64(int(d)/4))
 	return strconv.Itoa(day)
 }
 
@@ -204,14 +236,42 @@ func lunarDateAddOneDay(solarDay string) time.Time {
 	return nexLunarDay
 }
 
-func weekOfMonth(now time.Time) int {
-	beginningOfTheMonth := time.Date(now.Year(), now.Month(), 1, 1, 1, 1, 1, time.UTC)
-	_, thisWeek := now.ISOWeek()
-	_, beginningWeek := beginningOfTheMonth.ISOWeek()
-	return 1 + thisWeek - beginningWeek
+// IsWeekdayN reports whether the given date is the nth occurrence of the
+// day in the month.
+//
+// The value of n affects the direction of counting:
+//   n > 0: counting begins at the first day of the month.
+//   n == 0: the result is always false.
+//   n < 0: counting begins at the end of the month.
+func IsWeekdayN(date time.Time, day time.Weekday, n int) bool {
+	cday := date.Weekday()
+	if cday != day || n == 0 {
+		return false
+	}
+
+	if n > 0 {
+		return (date.Day()-1)/7 == (n - 1)
+	}
+
+	n = -n
+	last := time.Date(date.Year(), date.Month()+1,
+		1, 12, 0, 0, 0, date.Location())
+	lastCount := 0
+	for {
+		last = last.AddDate(0, 0, -1)
+		if last.Weekday() == day {
+			lastCount++
+		}
+		if lastCount == n || last.Month() != date.Month() {
+			break
+		}
+	}
+	return lastCount == n && last.Month() == date.Month() &&
+		last.Day() == date.Day()
+
 }
 
-func isLeapYear(year int) bool  {
+func isLeapYear(year int) bool {
 	if year%4 == 0 && year%100 != 0 || year%400 == 0 {
 		return true
 	}
@@ -237,7 +297,7 @@ func isDayOfLastWeeekInTheMonth(now time.Time, weekNumber int) bool {
 	_, lastWeekOfMonth := endDayOfMonth.ISOWeek()
 	_, nowWeekOfMonth := now.ISOWeek()
 	dayOfWeek := (int(endDayOfMonth.Weekday()) + 1) % 7
-	if dayOfWeek > weekNumber && lastWeekOfMonth > nowWeekOfMonth {
+	if dayOfWeek < weekNumber && lastWeekOfMonth > nowWeekOfMonth {
 		dayDuaration, _ := time.ParseDuration("-24h")
 		endDayOfMonth = endDayOfMonth.Add(dayDuaration * time.Duration(7))
 		_, lastWeekOfMonth = endDayOfMonth.ISOWeek()
